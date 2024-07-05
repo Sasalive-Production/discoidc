@@ -1,0 +1,29 @@
+name: "Test"
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  check:
+    name: Cargo Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - run: |
+          rustup set profile minimal
+          rustup install stable
+          rustup component add clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: discoidc
+
+      - run: cargo check
+      - run: cargo test
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy

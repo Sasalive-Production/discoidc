@@ -1,0 +1,26 @@
+[package]
+name = "discoidc"
+version = "0.1.0"
+edition = "2021"
+authors = ["nekok500"]
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.86"
+axum = "0.7.5"
+chrono = "0.4.38"
+clap = { version = "4.5.8", features = ["derive", "env"] }
+futures = "0.3.30"
+josekit = "0.8.6"
+oauth2 = { version = "4.4.2", features = ["reqwest"] }
+openidconnect = "3.5.0"
+rand = "0.8.5"
+reqwest = { version = "0.12.5", features = ["json"] }
+rsa = "0.9.6"
+serde = "1.0.203"
+serde_json = "1.0.120"
+tokio = { version = "1.38.0", features = ["rt-multi-thread", "rt", "macros"] }
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+url = "2.5.2"
+uuid = { version = "1.9.1", features = ["v4", "fast-rng"] }
