@@ -18,7 +18,12 @@ use axum::{
 use chrono::Utc;
 use clap::Parser;
 use josekit::{
-    jwe::{alg::aesgcmkw::AesgcmkwJweAlgorithm::A128gcmkw, JweHeader},
+    jwe::{
+        alg::aesgcmkw::{
+            AesgcmkwJweAlgorithm::A128gcmkw, AesgcmkwJweDecrypter, AesgcmkwJweEncrypter,
+        },
+        JweHeader,
+    },
     jwt::{self, JwtPayload},
 };
 use oauth2::{
@@ -36,6 +41,7 @@ use openidconnect::{
     JsonWebKeySetUrl, LocalizedClaim, PrivateSigningKey, ResponseTypes, Scope, StandardClaims,
     SubjectIdentifier, TokenUrl,
 };
+use rand::RngCore;
 use rsa::{
     pkcs1::EncodeRsaPrivateKey,
     pkcs8::{der::zeroize::Zeroizing, LineEnding},
@@ -55,12 +61,12 @@ struct Config {
     client_secret: String,
     #[arg(long, env)]
     issuer_url: Url,
-    #[arg(long, env)]
+    #[arg(long, env, default_value = "0.0.0.0:3000")]
     bind: SocketAddr,
     #[arg(long, env, default_value = "https://sasalivepro.com")]
     default_redirect: Url,
     #[arg(long, env)]
-    key: String,
+    key: Option<String>,
     #[arg(long, env, help = "client_id:redirect_uri")]
     clients: String,
     #[arg(
@@ -86,6 +92,8 @@ struct AppState {
     config: Arc<Config>,
     rsa_pem: Zeroizing<String>,
     key_id: String,
+    encrypter: AesgcmkwJweEncrypter,
+    decrypter: AesgcmkwJweDecrypter,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -193,8 +201,7 @@ async fn authorize(
             .context("failed to add duration")?,
     );
 
-    let encrypter = A128gcmkw.encrypter_from_bytes(state.config.key.as_bytes())?;
-    let jwt = jwt::encode_with_encrypter(&payload, &header, &encrypter)?;
+    let jwt = jwt::encode_with_encrypter(&payload, &header, &state.encrypter)?;
 
     let (auth_url, _csrf_token) = state
         .client
@@ -250,8 +257,7 @@ async fn callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackParams>,
 ) -> Result<Response<Body>, AppError> {
-    let decrypter = A128gcmkw.decrypter_from_bytes(state.config.key.as_bytes())?;
-    let (payload, _) = jwt::decode_with_decrypter(params.state, &decrypter)?;
+    let (payload, _) = jwt::decode_with_decrypter(params.state, &state.decrypter)?;
 
     if payload.expires_at().context("failed to get token exp")? < SystemTime::now() {
         return Ok((
@@ -478,6 +484,18 @@ async fn main() -> anyhow::Result<()> {
     let rsa_pem = private.to_pkcs1_pem(LineEnding::LF)?;
     let key_id = Uuid::new_v4().to_string();
 
+    let key = if let Some(key) = &config.key {
+        key.as_bytes().to_owned()
+    } else {
+        let mut key = vec![0u8; 16];
+        rng.try_fill_bytes(&mut key)?;
+
+        key
+    };
+
+    let encrypter = A128gcmkw.encrypter_from_bytes(key.clone())?;
+    let decrypter = A128gcmkw.decrypter_from_bytes(key)?;
+
     let state = AppState {
         client,
         clients,
@@ -485,6 +503,8 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         rsa_pem,
         key_id,
+        encrypter,
+        decrypter,
     };
 
     let jwks = CoreJsonWebKeySet::new(vec![CoreRsaPrivateSigningKey::from_pem(
