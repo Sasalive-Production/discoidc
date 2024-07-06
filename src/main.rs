@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc};
 
 use anyhow::{bail, Context as _, Error};
 use axum::{
@@ -12,36 +6,32 @@ use axum::{
     extract::{Query, State},
     http::{Response, StatusCode},
     response::{IntoResponse, Redirect},
-    routing::get,
-    Json, Router,
+    routing::{get, post},
+    Form, Json, Router,
 };
-use chrono::Utc;
+use axum_extra::{
+    headers::{authorization::Basic, Authorization},
+    TypedHeader,
+};
+use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
-use josekit::{
-    jwe::{
-        alg::aesgcmkw::{
-            AesgcmkwJweAlgorithm::A128gcmkw, AesgcmkwJweDecrypter, AesgcmkwJweEncrypter,
-        },
-        JweHeader,
-    },
-    jwt::{self, JwtPayload},
-};
 use oauth2::{
-    basic::BasicClient, reqwest::async_http_client, AuthorizationCode, ClientId, ClientSecret,
-    CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, TokenResponse,
+    basic::BasicClient, reqwest::async_http_client, AccessToken, AuthorizationCode, ClientId,
+    ClientSecret, CsrfToken, EmptyExtraTokenFields, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, StandardTokenResponse, TokenResponse,
 };
 use openidconnect::{
     core::{
         CoreClaimName, CoreGenderClaim, CoreJsonWebKeySet, CoreJsonWebKeyType,
         CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm, CoreProviderMetadata,
-        CoreResponseType, CoreRsaPrivateSigningKey, CoreSubjectIdentifierType,
+        CoreResponseType, CoreRsaPrivateSigningKey, CoreSubjectIdentifierType, CoreTokenType,
     },
     AdditionalClaims, Audience, AuthUrl, EmptyAdditionalProviderMetadata, EndUserEmail,
-    EndUserName, EndUserUsername, IdToken, IdTokenClaims, IssuerUrl, JsonWebKeyId,
+    EndUserName, EndUserUsername, IdToken, IdTokenClaims, IdTokenFields, IssuerUrl, JsonWebKeyId,
     JsonWebKeySetUrl, LocalizedClaim, PrivateSigningKey, ResponseTypes, Scope, StandardClaims,
     SubjectIdentifier, TokenUrl,
 };
-use rand::RngCore;
+use rand::{distributions::Alphanumeric, Rng as _};
 use rsa::{
     pkcs1::EncodeRsaPrivateKey,
     pkcs8::{der::zeroize::Zeroizing, LineEnding},
@@ -49,7 +39,7 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::RwLock};
 use url::Url;
 use uuid::Uuid;
 
@@ -87,40 +77,45 @@ struct Mapping {
 #[derive(Clone)]
 struct AppState {
     client: BasicClient,
-    clients: HashMap<String, Url>,
+    clients: HashMap<String, OAuthClient>,
     mappings: Vec<Mapping>,
     config: Arc<Config>,
     rsa_pem: Zeroizing<String>,
     key_id: String,
-    encrypter: AesgcmkwJweEncrypter,
-    decrypter: AesgcmkwJweDecrypter,
+    data: Arc<RwLock<HashMap<String, Data>>>,
+    codedata: Arc<RwLock<HashMap<String, CodeData>>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+struct OAuthClient {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: Url,
+}
+
 struct Data {
-    csrf_token: String,
     client_id: String,
     pkce_verifier: PkceCodeVerifier,
     state: Option<String>,
     scopes: Vec<AppScope>,
+    response_type: AllowedResponseTypes,
+    issued_at: DateTime<Utc>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum AllowedResponseTypes {
     IdToken,
+    Code,
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct AuthorizeParams {
     client_id: String,
     redirect_uri: Url,
     response_type: AllowedResponseTypes,
     scope: String,
     state: Option<String>,
-    // code_challenge: String, TODO
-    // code_challenge_method: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
@@ -156,7 +151,7 @@ async fn authorize(
         .map(AppScope::from_str)
         .collect::<Result<Vec<_>, _>>()?;
 
-    let Some(redirect_uri) = state.clients.get(&params.client_id) else {
+    let Some(client) = state.clients.get(&params.client_id) else {
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -166,7 +161,7 @@ async fn authorize(
             .into_response());
     };
 
-    if redirect_uri.clone() != params.redirect_uri {
+    if client.redirect_uri != params.redirect_uri {
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -178,34 +173,22 @@ async fn authorize(
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    let mut header = JweHeader::new();
-    header.set_token_type("JWT");
-    header.set_content_encryption("A128CBC-HS256");
-
-    let current = SystemTime::now();
-    let mut payload = JwtPayload::new();
-    payload.set_claim(
-        "data",
-        Some(serde_json::to_value(Data {
-            csrf_token: CsrfToken::new_random().secret().to_string(),
+    let code = Uuid::new_v4().to_string();
+    state.data.write().await.insert(
+        code.clone(),
+        Data {
             pkce_verifier,
             client_id: params.client_id,
             state: params.state,
             scopes,
-        })?),
-    )?;
-    payload.set_issued_at(&current);
-    payload.set_expires_at(
-        &current
-            .checked_add(Duration::from_secs(60 * 10))
-            .context("failed to add duration")?,
+            response_type: params.response_type,
+            issued_at: Utc::now(),
+        },
     );
-
-    let jwt = jwt::encode_with_encrypter(&payload, &header, &state.encrypter)?;
 
     let (auth_url, _csrf_token) = state
         .client
-        .authorize_url(|| CsrfToken::new(jwt))
+        .authorize_url(|| CsrfToken::new(code))
         .add_scope(Scope::new("identify".to_string()))
         .add_scope(Scope::new("email".to_string()))
         .add_scope(Scope::new("guilds".to_string()))
@@ -253,13 +236,32 @@ type AppIdToken = IdToken<
     CoreJsonWebKeyType,
 >;
 
+struct CodeData {
+    id_token: AppIdToken,
+    client_id: String,
+    issued_at: DateTime<Utc>,
+}
+
 async fn callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackParams>,
 ) -> Result<Response<Body>, AppError> {
-    let (payload, _) = jwt::decode_with_decrypter(params.state, &state.decrypter)?;
+    let data = {
+        let mut lock = state.data.write().await;
+        let Some(data) = lock.remove(&params.state) else {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_code",
+                })),
+            )
+                .into_response());
+        };
 
-    if payload.expires_at().context("failed to get token exp")? < SystemTime::now() {
+        data
+    };
+
+    if (data.issued_at + Duration::minutes(10)) < Utc::now() {
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -269,14 +271,7 @@ async fn callback(
             .into_response());
     }
 
-    let data = serde_json::from_value::<Data>(
-        payload
-            .claim("data")
-            .context("failed to get claim")?
-            .clone(),
-    )?;
-
-    let redirect_uri = state
+    let client = state
         .clients
         .get(&data.client_id)
         .context("invaild client")?;
@@ -389,15 +384,126 @@ async fn callback(
     );
 
     let mut query: Vec<(&str, String)> = Vec::new();
-    query.push(("id_token", id_token.to_string()));
-
     if let Some(state) = data.state {
         query.push(("state", state));
     }
+    match data.response_type {
+        AllowedResponseTypes::IdToken => {
+            query.push(("id_token", id_token.to_string()));
+        }
+        AllowedResponseTypes::Code => {
+            let code = Uuid::new_v4().to_string();
+            state.codedata.write().await.insert(
+                code.clone(),
+                CodeData {
+                    id_token,
+                    client_id: data.client_id,
+                    issued_at: Utc::now(),
+                },
+            );
 
-    let url = Url::parse_with_params(redirect_uri.as_str(), query)?;
+            query.push(("code", code));
+        }
+    }
+
+    let url = Url::parse_with_params(client.redirect_uri.as_str(), query)?;
 
     Ok(Redirect::temporary(url.as_str()).into_response())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AllowedGrantType {
+    AuthorizationCode,
+}
+
+type AppTokenResponse = StandardTokenResponse<AppIdTokenFields, CoreTokenType>;
+type AppIdTokenFields = IdTokenFields<
+    AppClaims,
+    EmptyExtraTokenFields,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+    CoreJsonWebKeyType,
+>;
+
+#[derive(Serialize, Deserialize)]
+struct TokenRequest {
+    grant_type: AllowedGrantType,
+    code: String,
+    redirect_uri: Url,
+}
+
+async fn token(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Basic>>,
+    Form(params): Form<TokenRequest>,
+) -> Result<Response<Body>, AppError> {
+    let data = {
+        let mut lock = state.codedata.write().await;
+        let Some(data) = lock.remove(&params.code) else {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_code",
+                })),
+            )
+                .into_response());
+        };
+
+        data
+    };
+
+    if (data.issued_at + Duration::minutes(10)) < Utc::now() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "token expired",
+            })),
+        )
+            .into_response());
+    }
+
+    let client = state
+        .clients
+        .get(&data.client_id)
+        .context("invaild client")?;
+
+    if (auth.username() != client.client_id) || (auth.password() != client.client_secret) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "invalid_client",
+            })),
+        )
+            .into_response());
+    };
+
+    if params.redirect_uri != client.redirect_uri {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_redirect_uri",
+            })),
+        )
+            .into_response());
+    };
+
+    let access_token: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+
+    Ok((
+        StatusCode::OK,
+        Json(AppTokenResponse::new(
+            AccessToken::new(access_token),
+            CoreTokenType::Bearer,
+            AppIdTokenFields::new(Some(data.id_token), EmptyExtraTokenFields {}),
+        )),
+    )
+        .into_response())
 }
 
 #[tokio::main]
@@ -409,7 +515,14 @@ async fn main() -> anyhow::Result<()> {
         .split(',')
         .map(|s| {
             let parts = s.split(':').collect::<Vec<_>>();
-            Ok::<(String, Url), Error>((parts[0].to_string(), Url::parse(&parts[1..].join(":"))?))
+            Ok::<(String, OAuthClient), Error>((
+                parts[0].to_string(),
+                OAuthClient {
+                    client_id: parts[0].to_string(),
+                    client_secret: parts[1].to_string(),
+                    redirect_uri: Url::parse(&parts[2..].join(":"))?,
+                },
+            ))
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
 
@@ -484,18 +597,6 @@ async fn main() -> anyhow::Result<()> {
     let rsa_pem = private.to_pkcs1_pem(LineEnding::LF)?;
     let key_id = Uuid::new_v4().to_string();
 
-    let key = if let Some(key) = &config.key {
-        key.as_bytes().to_owned()
-    } else {
-        let mut key = vec![0u8; 16];
-        rng.try_fill_bytes(&mut key)?;
-
-        key
-    };
-
-    let encrypter = A128gcmkw.encrypter_from_bytes(key.clone())?;
-    let decrypter = A128gcmkw.decrypter_from_bytes(key)?;
-
     let state = AppState {
         client,
         clients,
@@ -503,8 +604,8 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         rsa_pem,
         key_id,
-        encrypter,
-        decrypter,
+        data: Arc::new(RwLock::new(HashMap::new())),
+        codedata: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let jwks = CoreJsonWebKeySet::new(vec![CoreRsaPrivateSigningKey::from_pem(
@@ -522,6 +623,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/.well-known/openid-configuration", get(Json(metadata)))
         .route("/jwks", get(Json(jwks)))
         .route("/authorize", get(authorize))
+        .route("/token", post(token))
         .route("/callback", get(callback))
         .with_state(state);
     let listener = TcpListener::bind(config.bind).await?;
