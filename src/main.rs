@@ -57,7 +57,11 @@ struct Config {
     default_redirect: Url,
     #[arg(long, env)]
     key: Option<String>,
-    #[arg(long, env, help = "client_id:redirect_uri")]
+    #[arg(
+        long,
+        env,
+        help = "client_id:client_secret:required_group:redirect_uri"
+    )]
     clients: String,
     #[arg(
         long,
@@ -92,6 +96,7 @@ struct AppState {
 struct OAuthClient {
     client_id: String,
     client_secret: String,
+    required_group: Option<String>,
     redirect_uri: Url,
 }
 
@@ -341,6 +346,18 @@ async fn callback(
         vec![]
     };
 
+    if let Some(required_groups) = &client.required_group {
+        if !groups.iter().any(|g| g == required_groups) {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "invalid_group",
+                })),
+            )
+                .into_response());
+        }
+    }
+
     let mut claims = StandardClaims::new(SubjectIdentifier::new(user.id.clone()));
     if data.scopes.contains(&AppScope::Profile) {
         let mut username = LocalizedClaim::new();
@@ -517,12 +534,18 @@ async fn main() -> anyhow::Result<()> {
         .split(',')
         .map(|s| {
             let parts = s.split(':').collect::<Vec<_>>();
+            let required_groups = match parts[2].len() {
+                0 => None,
+                _ => Some(parts[2].to_string()),
+            };
+
             Ok::<(String, OAuthClient), Error>((
                 parts[0].to_string(),
                 OAuthClient {
                     client_id: parts[0].to_string(),
                     client_secret: parts[1].to_string(),
-                    redirect_uri: Url::parse(&parts[2..].join(":"))?,
+                    required_group: required_groups,
+                    redirect_uri: Url::parse(&parts[3..].join(":"))?,
                 },
             ))
         })
