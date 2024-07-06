@@ -65,6 +65,8 @@ struct Config {
         help = "'guild_id:role_id:group_name' or 'guild_id:group_name'"
     )]
     mappings: String,
+    #[arg(long, env, default_value = "true")]
+    force_add_groups: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -297,7 +299,7 @@ async fn callback(
 
     let mut guild_roles: HashMap<String, Vec<String>> = HashMap::new();
 
-    let groups = if data.scopes.contains(&AppScope::Groups) {
+    let groups = if state.config.force_add_groups || data.scopes.contains(&AppScope::Groups) {
         let mut groups = vec![];
 
         for m in state.mappings {
